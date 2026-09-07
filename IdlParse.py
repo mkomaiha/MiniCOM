@@ -356,6 +356,116 @@ def GenerateCInterfaces (source):
     return source
 
 
+def ParameterName (param):
+    '''Name of a parameter, e.g. "res" for "float res[3]".'''
+    without_array = re.sub('\\[[0-9]*\\]\\s*$', '', param).strip()
+    match = re.search('([a-zA-Z_][a-zA-Z0-9_]*)\\s*$', without_array)
+    if not match:
+        raise Exception('unnamed parameter: "'+param+'"')
+    return match.group(1)
+
+
+def GenerateCallbackObjects (source):
+    '''Emit a way to implement each interface from outside C++.
+
+    A caller that cannot declare a C++ class still has to hand the library an
+    object when an interface is used for callbacks. It supplies a table of
+    plain function pointers instead, and gets back an ordinary COM object that
+    forwards to them, so that QueryInterface and the reference counting stay
+    in one place rather than being reimplemented per language binding.
+    '''
+    interfaces = FindInterfaceDefinitions(source)
+    methods_of = {name: methods for name, _, methods, _, _ in interfaces}
+    base_of    = {name: base for name, base, _, _, _ in interfaces}
+
+    def AllMethods (name):
+        '''Own methods, preceded by every inherited one, in vtable order.'''
+        base = base_of.get(name)
+        inherited = AllMethods(base) if base and base != 'IUnknown' else []
+        return inherited+methods_of.get(name, [])
+
+    def BaseIsVisible (name):
+        base = base_of.get(name)
+        if not base or base == 'IUnknown':
+            return True
+        return base in methods_of and BaseIsVisible(base)
+
+    out = ''
+    out += '\n/* Implementing these interfaces from outside C++. Each interface gets a\n'
+    out += '   table of function pointers and a factory that wraps one in a COM object\n'
+    out += '   forwarding to it. A null entry answers E_NOTIMPL, "context" is passed\n'
+    out += '   back untouched, and "Destroy" runs when the last reference goes. */\n\n'
+    out += '#ifndef MINICOM_CALLBACK_API\n'
+    out += '#define MINICOM_CALLBACK_API inline // define to the export attribute to ship these\n'
+    out += '#endif\n'
+
+    for name, _, _, _, _ in interfaces:
+        if not BaseIsVisible(name):
+            out += '\n/* no callback support for '+name+': it inherits from '
+            out += base_of.get(name)+', declared in another IDL file. */\n'
+            continue
+
+        methods = AllMethods(name)
+        table = name+'Callbacks'
+
+        out += '\ntypedef struct '+table+' {\n'
+        for method, arglist in methods:
+            params = SplitParameters(arglist)
+            out += '    HRESULT (*'+method+')(void* context'
+            out += ''.join(', '+p for p in params)+');\n'
+        out += '    void    (*Destroy)(void* context);\n'
+        out += '} '+table+';\n\n'
+
+        # the object needs the C++ interface, so translation units that asked for
+        # the C style vtable definitions get the factory declaration only
+        out += '\n#if !defined(CINTERFACE)\n'
+        out += 'class '+name+'_Callback : public CComObjectRootEx<CComMultiThreadModel>, public '+name+' {\n'
+        out += 'public:\n'
+        for method, arglist in methods:
+            params = SplitParameters(arglist)
+            out += '    HRESULT '+method+' ('+', '.join(params)+') override {\n'
+            out += '        if (!m_callbacks.'+method+')\n'
+            out += '            return E_NOTIMPL;\n'
+            out += '        return m_callbacks.'+method+'(m_context'
+            out += ''.join(', '+ParameterName(p) for p in params)+');\n'
+            out += '    }\n\n'
+        out += '    ~'+name+'_Callback () {\n'
+        out += '        if (m_callbacks.Destroy)\n'
+        out += '            m_callbacks.Destroy(m_context);\n'
+        out += '    }\n\n'
+        out += '    '+table+' m_callbacks{};\n'
+        out += '    void*  m_context = nullptr;\n\n'
+        out += '    BEGIN_COM_MAP('+name+'_Callback)\n'
+        entry = name
+        while entry and entry != 'IUnknown':
+            out += '        COM_INTERFACE_ENTRY('+entry+')\n'
+            entry = base_of.get(entry)
+        out += '    END_COM_MAP()\n'
+        out += '};\n\n'
+
+        out += 'extern "C" MINICOM_CALLBACK_API\n'
+        out += 'HRESULT '+name+'_CreateCallback (const '+table+'* callbacks, void* context, '+name+'** obj) {\n'
+        out += '    if (!callbacks || !obj)\n'
+        out += '        return E_POINTER;\n'
+        out += '    *obj = nullptr;\n\n'
+        out += '    CComObject<'+name+'_Callback>* tmp = nullptr;\n'
+        out += '    HRESULT hr = CComObject<'+name+'_Callback>::CreateInstance(&tmp);\n'
+        out += '    if (FAILED(hr))\n'
+        out += '        return hr;\n\n'
+        out += '    tmp->m_callbacks = *callbacks;\n'
+        out += '    tmp->m_context = context;\n'
+        out += '    tmp->AddRef();\n'
+        out += '    *obj = tmp;\n'
+        out += '    return S_OK;\n'
+        out += '}\n'
+        out += '#else\n'
+        out += 'extern "C" MINICOM_CALLBACK_API\n'
+        out += 'HRESULT '+name+'_CreateCallback (const '+table+'* callbacks, void* context, '+name+'** obj);\n'
+        out += '#endif\n'
+
+    return out
+
+
 def ParseIdlFile (idl_file, h_file, c_file):
     with open(idl_file, 'r') as f:
         source = f.read()
@@ -369,6 +479,7 @@ def ParseIdlFile (idl_file, h_file, c_file):
     source = ParseInterfaces(source)
     source = ParseSafeArray(source)
     source = GenerateCInterfaces(source)
+    callbacks = GenerateCallbackObjects(source)
     source = ReplaceComments(source, comments)
     source, last_import = ParseImport(source)
     source = ParseCppQuote(source)
@@ -383,6 +494,7 @@ def ParseIdlFile (idl_file, h_file, c_file):
         f.write('} //extern "C"\n')
         for interface in interfaces:
             f.write('DEFINE_UUIDOF('+interface+')\n')
+        f.write(callbacks)
     
     with open(c_file, 'w') as f:
         f.write('#include "'+h_file+'"\n')
