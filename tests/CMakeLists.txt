@@ -31,7 +31,8 @@ set(TEST_SOURCES
     StringTests.cpp
     )
 if(NOT WIN32)
-    list(APPEND TEST_SOURCES "../NonWindows.cpp")
+    # the callback objects come from IdlParse.py, which midl has no equivalent for
+    list(APPEND TEST_SOURCES "../NonWindows.cpp" ExampleCallbackTests.cpp)
 endif()
 
 set(IDL_INPUTS  "${CMAKE_CURRENT_SOURCE_DIR}/Example.idl")
