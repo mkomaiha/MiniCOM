@@ -438,33 +438,21 @@ inline void _com_issue_errorex(HRESULT hr, IUnknown*, const IID &) {
 
 #if !defined(CINTERFACE)
 
-// Mute warning for "delete this" in END_COM_MAP() Release(). The warning is formally correct,
-// since a CComObject<CLASS> is deleted through a CLASS pointer without a virtual destructor.
-// It's nevertheless safe in practice, since CComObject is final, adds no data members
-// (enforced by static_assert) and has no destructor.
-#ifdef __clang__
-  #define APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_PUSH \
-    _Pragma("clang diagnostic push") \
-    _Pragma("clang diagnostic ignored \"-Wdelete-non-abstract-non-virtual-dtor\"")
-  #define APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_POP \
-    _Pragma("clang diagnostic pop")
-#else
-  #define APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_PUSH \
-    _Pragma("GCC diagnostic push") \
-    _Pragma("GCC diagnostic ignored \"-Wdelete-non-virtual-dtor\"")
-  #define APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_POP \
-    _Pragma("GCC diagnostic pop")
-#endif
-
-
+/** Most-derived COM class that implements IUnknown reference-counting on top of BASE.
+    Mirrors ATL, where BASE gets QueryInterface from BEGIN_COM_MAP/END_COM_MAP & the ref-count from CComObjectRootEx. */
 template <class BASE>
-class CComObject final : public BASE { // final to make "delete ptr" safe without a virtual destructor
+class CComObject final : public BASE { // final to make "delete this" safe without a virtual destructor
 public:
-    CComObject() {
-        static_assert(sizeof(*this) == sizeof(BASE)); // ensure it's safe to delete a BASE pointer without leaking memory
+    ULONG AddRef () override {
+        return BASE::InternalAddRef();
     }
+    ULONG Release () override {
+        ULONG ref = BASE::InternalRelease();
+        if (!ref)
+            delete this;
 
-    /* NO destructor here, since it's not guaranteed to be called. */
+        return ref;
+    }
 
     static HRESULT CreateInstance (CComObject<BASE> ** arg) {
         assert(arg);
@@ -1322,21 +1310,9 @@ template <> unsigned int CComSafeArray<IUnknown*>::GetCount () const;
                                        } \
                                        return E_NOINTERFACE; \
                                      } \
-                                     ULONG AddRef () override { \
-                                         assert((m_ref < 0xFFFF) && "IUnknown::AddRef negative ref count."); \
-                                         return ++m_ref; \
-                                     } \
-                                     ULONG Release () override { \
-                                         ULONG ref = --m_ref; \
-                                         assert((m_ref < 0xFFFF) && "IUnknown::Release negative ref count."); \
-                                         if (!ref) { \
-                                            APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_PUSH \
-                                             delete this; \
-                                            APPAPI_MUTE_DELETE_NON_VIRTUAL_DTOR_WARNING_POP \
-                                         } \
-                                         return ref; \
-                                     } \
-                                     std::atomic<ULONG> m_ref {0};
+                                     /* implemented by CComObject or CComContainedObject. Also disambiguates between IUnknown base-classes */ \
+                                     ULONG AddRef () override = 0; \
+                                     ULONG Release () override = 0;
 
 #define DECLARE_PROTECT_FINAL_CONSTRUCT()
 
@@ -1352,6 +1328,20 @@ public:
     HRESULT FinalConstruct() {
         return S_OK;
     }
+
+    // reference-counting used by CComObject
+    ULONG InternalAddRef() {
+        assert((m_ref < 0xFFFF) && "IUnknown::AddRef negative ref count.");
+        return ++m_ref;
+    }
+    ULONG InternalRelease() {
+        ULONG ref = --m_ref;
+        assert((m_ref < 0xFFFF) && "IUnknown::Release negative ref count.");
+        return ref;
+    }
+
+protected:
+    std::atomic<ULONG> m_ref {0};
 };
 
 template <class T, const GUID* pclsid = nullptr>
