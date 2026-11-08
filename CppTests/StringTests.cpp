@@ -108,3 +108,60 @@ TEST(StringTests, Verify_BSTR_output_argument) {
     PassBSTROutputArgument(str.GetAddress()); // GetAddress will auto-clear existing content
     ASSERT_STREQ(str, L"New string");
 }
+
+
+TEST(StringTests, Verify_BSTR_memory_layout) {
+    // allocate a BSTR with an embedded zero
+    const wchar_t src[] = {L'a', L'b', L'\0', L'c'};
+    BSTR str = SysAllocStringLen(src, 4);
+    ASSERT_NE(str, nullptr);
+
+    // length is stored in bytes in the 4 bytes before the string (sizeof(wchar_t) per character)
+    ASSERT_EQ(SysStringLen(str), 4u);
+    ASSERT_EQ(SysStringByteLen(str), 4*sizeof(wchar_t));
+    ASSERT_EQ(reinterpret_cast<const uint32_t*>(str)[-1], 4*sizeof(wchar_t));
+
+    // characters are copied verbatim and zero terminated
+    for (size_t i = 0; i < 4; ++i)
+        ASSERT_EQ(str[i], src[i]);
+    ASSERT_EQ(str[4], L'\0');
+
+    SysFreeString(str);
+
+    // nullptr is a valid empty string
+    ASSERT_EQ(SysAllocString(nullptr), nullptr);
+    ASSERT_EQ(SysStringLen(nullptr), 0u);
+    ASSERT_EQ(SysStringByteLen(nullptr), 0u);
+    SysFreeString(nullptr);
+}
+
+TEST(StringTests, Verify_CComBSTR_size_argument) {
+    // only the first "size" characters are copied
+    CComBSTR str(2, L"abcdef");
+    ASSERT_STREQ(str, L"ab");
+    ASSERT_EQ(str.Length(), 2u);
+    ASSERT_EQ(str.ByteLength(), 2*sizeof(wchar_t));
+
+    // zero size yields an empty (nullptr) string
+    CComBSTR empty(0, L"abc");
+    ASSERT_EQ(empty.m_str, nullptr);
+    ASSERT_EQ(empty.Length(), 0u);
+}
+
+TEST(StringTests, Verify_CComBSTR_AttachDetach) {
+    CComBSTR str1(L"string");
+
+    BSTR raw = str1.Detach(); // ownership transferred to caller
+    ASSERT_EQ(str1.m_str, nullptr);
+    ASSERT_EQ(SysStringLen(raw), 6u);
+
+    CComBSTR str2;
+    str2.Attach(raw); // ownership transferred back
+    ASSERT_STREQ(str2, L"string");
+
+    // Copy returns a BSTR that must be freed with SysFreeString
+    BSTR copy = str2.Copy();
+    ASSERT_NE(copy, raw);
+    ASSERT_STREQ(copy, L"string");
+    SysFreeString(copy);
+}
